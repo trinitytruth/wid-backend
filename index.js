@@ -347,6 +347,12 @@ app.get('/debug/openai', (_req, res) => {
   const ok = !!(process.env.OPENAI_API_KEY && process.env.OPENAI_API_KEY.trim());
   res.json({ hasKey: ok });
 });
+// TEMP: allow GET /reindex (for easy clicking in browser)
+app.get('/reindex', (req, res) => {
+  // forward this GET to the existing POST handler
+  req.method = 'POST';
+  app._router.handle(req, res, () => {});
+});
 
 // ===== Start =====
 const PORT = process.env.PORT || 3000;
