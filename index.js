@@ -342,6 +342,11 @@ app.post('/reindex', async (_req, res) => {
     client.release();
   }
 });
+// Debug: check if OPENAI_API_KEY is loaded (safe)
+app.get('/debug/openai', (_req, res) => {
+  const ok = !!(process.env.OPENAI_API_KEY && process.env.OPENAI_API_KEY.trim());
+  res.json({ hasKey: ok });
+});
 
 // ===== Start =====
 const PORT = process.env.PORT || 3000;
