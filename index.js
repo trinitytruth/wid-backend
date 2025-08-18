@@ -39,8 +39,7 @@ init().catch(err => {
 // Health check
 app.get('/health', (req, res) => res.json({ ok: true }));
 
-// Save answer
-// Body: { question: "string", text: "string" }
+// Save answer (primary endpoint)
 app.post('/save-answer', async (req, res) => {
   const { question, text } = req.body || {};
   if (!question || !text) return res.status(400).json({ error: 'question and text are required' });
@@ -62,8 +61,14 @@ app.post('/save-answer', async (req, res) => {
   }
 });
 
+// --- Aliases so frontend can hit multiple possible paths ---
+app.post(['/saveAnswer', '/answers', '/api/answers', '/api/saveAnswer', '/intake/answers', '/v1/answer'], async (req, res) => {
+  // Just forward to the main handler
+  req.url = '/save-answer';
+  app._router.handle(req, res, () => {});
+});
+
 // Chat (echo + simple retrieval)
-// Body: { message: "string" }
 app.post('/chat', async (req, res) => {
   const { message } = req.body || {};
   if (!message) return res.status(400).json({ error: 'message is required' });
