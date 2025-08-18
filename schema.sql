@@ -33,11 +33,11 @@ CREATE TABLE IF NOT EXISTS media (
   url TEXT,
   duration_sec INT
 );
--- Embeddings for RAG (one row per answer for MVP)
+
 CREATE TABLE IF NOT EXISTS answer_embeddings (
   answer_id   INTEGER PRIMARY KEY REFERENCES answers(id) ON DELETE CASCADE,
   content     TEXT NOT NULL,
-  embedding   JSONB NOT NULL,              -- store as JSON array for simplicity
+  embedding   JSONB NOT NULL,
   created_at  TIMESTAMP NOT NULL DEFAULT NOW(),
   updated_at  TIMESTAMP NOT NULL DEFAULT NOW()
 );
