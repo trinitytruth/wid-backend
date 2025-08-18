@@ -101,6 +101,80 @@ app.post('/chat', async (req, res) => {
     client.release();
   }
 });
+// List recent answers (for sanity check)
+app.get('/answers', async (_req, res) => {
+  const client = await pool.connect();
+  try {
+    const q = `
+      SELECT question, answer_text, created_at
+      FROM answers
+      ORDER BY created_at DESC
+      LIMIT 100;
+    `;
+    const { rows } = await client.query(q);
+    res.json({ items: rows });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'db_error' });
+  } finally {
+    client.release();
+  }
+});
+
+// Count answers
+app.get('/answers/count', async (_req, res) => {
+  const client = await pool.connect();
+  try {
+    const { rows } = await client.query('SELECT COUNT(*)::int AS count FROM answers;');
+    res.json({ count: rows[0].count });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'db_error' });
+  } finally {
+    client.release();
+  }
+});
+
+// Export JSON
+app.get('/export/json', async (_req, res) => {
+  const client = await pool.connect();
+  try {
+    const { rows } = await client.query(
+      'SELECT question, answer_text, created_at FROM answers ORDER BY created_at ASC;'
+    );
+    res.setHeader('Content-Type', 'application/json');
+    res.setHeader('Content-Disposition', 'attachment; filename="wid_answers.json"');
+    res.send(JSON.stringify(rows, null, 2));
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'db_error' });
+  } finally {
+    client.release();
+  }
+});
+
+// Export CSV
+app.get('/export/csv', async (_req, res) => {
+  const client = await pool.connect();
+  try {
+    const { rows } = await client.query(
+      'SELECT question, answer_text, created_at FROM answers ORDER BY created_at ASC;'
+    );
+    const header = 'question,answer_text,created_at\n';
+    const escape = (s='') => `"${String(s).replaceAll('"', '""')}"`;
+    const csv = header + rows.map(r =>
+      [r.question, r.answer_text, r.created_at.toISOString()].map(escape).join(',')
+    ).join('\n');
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', 'attachment; filename="wid_answers.csv"');
+    res.send(csv);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'db_error' });
+  } finally {
+    client.release();
+  }
+});
 
 // Render provides PORT
 const PORT = process.env.PORT || 3000;
