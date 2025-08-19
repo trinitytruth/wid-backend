@@ -14,9 +14,11 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false } // Render PG uses SSL
 });
 
-ALTER TABLE profiles
-  ADD COLUMN IF NOT EXISTS pin TEXT;
-CREATE UNIQUE INDEX IF NOT EXISTS profiles_name_key ON profiles (name);
+function parseProfileId(req) {
+  const raw = req.get('x-profile-id');
+  const id = Number(raw);
+  return Number.isInteger(id) && id > 0 ? id : null;
+}
 
 /* ---------------- OpenAI (guarded) ---------------- */
 const hasOpenAI = !!(process.env.OPENAI_API_KEY && process.env.OPENAI_API_KEY.trim());
