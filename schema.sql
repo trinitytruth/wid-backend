@@ -45,3 +45,15 @@ CREATE TABLE IF NOT EXISTS answer_embeddings (
 ALTER TABLE profiles
   ADD COLUMN IF NOT EXISTS pin TEXT;
 CREATE UNIQUE INDEX IF NOT EXISTS profiles_name_key ON profiles (name);
+
+-- Track updates on answers (for editing)
+ALTER TABLE answers
+  ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT now();
+
+-- Helpful indexes
+CREATE INDEX IF NOT EXISTS answers_profile_id_idx ON answers (profile_id);
+CREATE INDEX IF NOT EXISTS answers_created_at_idx ON answers (created_at);
+
+-- Ensure your unique name index doesn't have a stray backslash
+-- (If it already exists, this is fine.)
+CREATE UNIQUE INDEX IF NOT EXISTS profiles_name_key ON profiles (name);
