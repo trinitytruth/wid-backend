@@ -271,16 +271,18 @@ A: ${r.answer_text}`
 });
 
 /* ---------------- Review & Export helpers ---------------- */
-app.get('/answers', async (_req, res) => {
+app.get('/answers', async (req, res) => {
   const client = await pool.connect();
   try {
+    const headerProfileId = parseProfileId(req); // optional
     const q = `
-      SELECT question, answer_text, created_at
+      SELECT id, question, answer_text, created_at, updated_at
       FROM answers
+      WHERE ($1::bigint IS NULL OR profile_id = $1)
       ORDER BY created_at DESC
       LIMIT 100;
     `;
-    const { rows } = await client.query(q);
+    const { rows } = await client.query(q, [headerProfileId]);
     res.json({ items: rows });
   } catch (e) {
     console.error(e);
