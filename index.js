@@ -14,18 +14,16 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false } // Render PG uses SSL
 });
 
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+/* ---------------- OpenAI (guarded) ---------------- */
+const hasOpenAI = !!(process.env.OPENAI_API_KEY && process.env.OPENAI_API_KEY.trim());
+const openai = hasOpenAI ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY }) : null;
 
-// ===== Embedding helpers (2a / 2b) =====
 async function embedText(text) {
-  const input = String(text || '').slice(0, 3000); // cost guard
-  const resp = await openai.embeddings.create({
-    model: 'text-embedding-3-small',
-    input
-  });
+  if (!openai) throw new Error('no_openai_key');
+  const input = String(text || '').slice(0, 3000);
+  const resp = await openai.embeddings.create({ model: 'text-embedding-3-small', input });
   return resp.data[0].embedding; // number[]
 }
-
 function cosineSim(a, b) {
   let dot = 0, na = 0, nb = 0;
   const len = Math.min(a.length, b.length);
@@ -37,13 +35,12 @@ function cosineSim(a, b) {
   return dot / denom;
 }
 
-// ===== DB init =====
+/* ---------------- DB init ---------------- */
 async function init() {
   const client = await pool.connect();
   try {
     const schema = readFileSync('./schema.sql', 'utf8');
     await client.query(schema);
-
     // Ensure a default profile exists
     const { rows } = await client.query("SELECT id FROM profiles ORDER BY id LIMIT 1;");
     if (rows.length === 0) {
@@ -59,10 +56,13 @@ init().catch(err => {
   process.exit(1);
 });
 
-// ===== Health =====
+/* ---------------- Health & debug ---------------- */
 app.get('/health', (_req, res) => res.json({ ok: true }));
+app.get('/debug/openai', (_req, res) => {
+  res.json({ hasKey: hasOpenAI });
+});
 
-// ===== Save Answer (2c: now also writes embedding) =====
+/* ---------------- Save Answer (writes embedding) ---------------- */
 async function saveAnswerCore(client, { question, text }) {
   const prof = await client.query("SELECT id FROM profiles ORDER BY id LIMIT 1;");
   const profileId = prof.rows[0].id;
@@ -73,15 +73,15 @@ async function saveAnswerCore(client, { question, text }) {
   );
   const answerId = result.rows[0].id;
 
-  // Best-effort embedding
+  // Best-effort embedding (don’t fail the request if this errors)
   try {
-    if (process.env.OPENAI_API_KEY) {
+    if (openai) {
       const emb = await embedText(text);
       await client.query(
         `INSERT INTO answer_embeddings (answer_id, content, embedding)
          VALUES ($1, $2, $3)
-         ON CONFLICT (answer_id)
-         DO UPDATE SET content = EXCLUDED.content, embedding = EXCLUDED.embedding, updated_at = NOW();`,
+         ON CONFLICT (answer_id) DO UPDATE
+         SET content = EXCLUDED.content, embedding = EXCLUDED.embedding, updated_at = NOW();`,
         [answerId, text, JSON.stringify(emb)]
       );
     }
@@ -92,7 +92,7 @@ async function saveAnswerCore(client, { question, text }) {
   return { id: answerId, created_at: result.rows[0].created_at };
 }
 
-// Primary endpoint your frontend uses
+// Primary endpoint the frontend uses
 app.post('/save-answer', async (req, res) => {
   const { question, text } = req.body || {};
   if (!question || !text) return res.status(400).json({ error: 'question and text are required' });
@@ -109,40 +109,48 @@ app.post('/save-answer', async (req, res) => {
   }
 });
 
-// Aliases (keep these so older frontend paths still work)
-app.post(['/saveAnswer', '/answers', '/api/answers', '/api/saveAnswer', '/intake/answers', '/v1/answer'], async (req, res) => {
-  const { question, text, question_id, response_text } = req.body || {};
-  // Map common alternate keys -> canonical
-  const q = question || `${question_id || ''}`.trim();
-  const t = text || response_text;
-  if (!q || !t) return res.status(400).json({ error: 'question and text are required' });
+// Aliases so older paths still work
+app.post(
+  ['/saveAnswer', '/answers', '/api/answers', '/api/saveAnswer', '/intake/answers', '/v1/answer'],
+  async (req, res) => {
+    const { question, text, question_id, response_text } = req.body || {};
+    const q = question || (question_id ? String(question_id) : '');
+    const t = text || response_text;
+    if (!q || !t) return res.status(400).json({ error: 'question and text are required' });
 
-  const client = await pool.connect();
-  try {
-    const out = await saveAnswerCore(client, { question: q, text: t });
-    res.json(out);
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: 'db_error' });
-  } finally {
-    client.release();
+    const client = await pool.connect();
+    try {
+      const out = await saveAnswerCore(client, { question: q, text: t });
+      res.json(out);
+    } catch (e) {
+      console.error(e);
+      res.status(500).json({ error: 'db_error' });
+    } finally {
+      client.release();
+    }
   }
-});
+);
 
-// ===== Chat (2e: RAG compose with citations; falls back if OpenAI unavailable) =====
+/* ---------------- Chat (RAG + tone controls) ---------------- */
 app.post('/chat', async (req, res) => {
-  const { message } = req.body || {};
+  const { message, tone } = req.body || {};
   if (!message) return res.status(400).json({ error: 'message is required' });
-  const disclosure = "AI reconstruction based on your recorded words.";
 
+  const disclosure = "AI reconstruction based on your recorded words.";
   const client = await pool.connect();
+
+  // Tone defaults (0..1 sliders)
+  const formality = typeof tone?.formality === 'number' ? tone.formality : 0.5; // 0=Casual, 1=Formal
+  const detail    = typeof tone?.detail === 'number'    ? tone.detail    : 0.5; // 0=Concise, 1=Story-rich
+  const humor     = typeof tone?.humor === 'number'     ? tone.humor     : 0.5; // 0=Serious, 1=Playful
+
   try {
-    if (!process.env.OPENAI_API_KEY) throw new Error('no_openai_key');
+    if (!openai) throw new Error('no_openai_key');
 
     // 1) Embed the query
     const qEmb = await embedText(message);
 
-    // 2) Retrieve candidate answers that have embeddings
+    // 2) Retrieve candidates with embeddings
     const { rows } = await client.query(`
       SELECT a.id, a.question, a.answer_text, e.embedding
       FROM answers a
@@ -158,60 +166,71 @@ app.post('/chat', async (req, res) => {
     }).sort((x, y) => y.score - x.score);
 
     const top = scored.slice(0, 5).filter(r => r.score > 0.1);
-
     if (!top.length) {
       return res.json({ answer: `I’m not sure I captured this while I was alive.\n\n${disclosure}` });
     }
 
-    // 4) Build prompt
+    // 4) Build prompt with tone guidance
     const context = top.map((r, i) =>
-      `[#${i + 1} · score=${r.score.toFixed(3)}]\nQ: ${r.question}\nA: ${r.answer_text}`
+      `[#${i + 1} · score=${r.score.toFixed(3)}]
+Q: ${r.question}
+A: ${r.answer_text}`
     ).join('\n\n');
+
+    const toneHints = [
+      `Formality: ${formality} (0=Casual, 1=Formal)`,
+      `Detail: ${detail} (0=Concise, 1=Story-rich)`,
+      `Humor: ${humor} (0=Serious, 1=Playful)`
+    ].join(' · ');
 
     const system = [
       "You are an AI reconstruction that MUST answer ONLY using the provided excerpts.",
-      "Use first person singular as the person, but do not invent new facts.",
-      "Be concise, warm, and clear. If uncertain, say so.",
-      "Always include the disclosure line at the end."
+      "Use first-person singular as the person, and do not invent new facts.",
+      "Be warm and clear. If uncertain, say so.",
+      `Match tone settings → ${toneHints}.`,
+      `Always end with: "${disclosure}"`
     ].join(' ');
 
-    const prompt = [
+    const userPrompt = [
       `User question: ${message}`,
       "",
       "Excerpts (evidence):",
       context,
       "",
-      "Write a short answer in the person's voice, synthesizing only from the excerpts.",
-      "If the excerpts don't contain enough info, say: \"I’m not sure I captured this while I was alive.\"",
-      `End with the disclosure line exactly: "${disclosure}"`
+      "Synthesize a short answer in the person's voice using only the excerpts.",
+      'If evidence is insufficient, say: "I’m not sure I captured this while I was alive."',
+      `End with exactly: "${disclosure}"`
     ].join('\n');
 
     const completion = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
       messages: [
         { role: 'system', content: system },
-        { role: 'user', content: prompt }
+        { role: 'user', content: userPrompt }
       ],
       temperature: 0.7,
       max_tokens: 300
     });
 
-    const answer = completion.choices?.[0]?.message?.content?.trim()
-      || `I’m not sure I captured this while I was alive.\n\n${disclosure}`;
+    const answer =
+      completion.choices?.[0]?.message?.content?.trim() ||
+      `I’m not sure I captured this while I was alive.\n\n${disclosure}`;
 
     return res.json({
       answer,
+      // citations available if you later want to show them
       citations: top.map((r, i) => ({ idx: i + 1, question: r.question, score: r.score }))
     });
+
   } catch (e) {
-    // Fallback: your original keyword-based answer so users aren't blocked
+    // Fallback to simple retrieval so chat never breaks
     console.warn('chat_fallback', e?.message || e);
     try {
       const q = `
         SELECT question, answer_text
         FROM answers
         WHERE answer_text ILIKE '%' || $1 || '%'
-           OR question ILIKE '%' || $1 || '%'
+           OR question    ILIKE '%' || $1 || '%'
         ORDER BY created_at DESC
         LIMIT 3;
       `;
@@ -230,7 +249,7 @@ app.post('/chat', async (req, res) => {
   }
 });
 
-// ===== Review & Export helpers (you already added) =====
+/* ---------------- Review & Export helpers ---------------- */
 app.get('/answers', async (_req, res) => {
   const client = await pool.connect();
   try {
@@ -287,10 +306,16 @@ app.get('/export/csv', async (_req, res) => {
       'SELECT question, answer_text, created_at FROM answers ORDER BY created_at ASC;'
     );
     const header = 'question,answer_text,created_at\n';
-    const escape = (s='') => `"${String(s).replaceAll('"', '""')}"`;
-    const csv = header + rows.map(r =>
-      [r.question, r.answer_text, new Date(r.created_at).toISOString()].map(escape).join(',')
-    ).join('\n');
+    const escape = (s = '') => `"${String(s).replaceAll('"', '""')}"`;
+    const csv =
+      header +
+      rows
+        .map(r =>
+          [r.question, r.answer_text, new Date(r.created_at).toISOString()]
+            .map(escape)
+            .join(',')
+        )
+        .join('\n');
     res.setHeader('Content-Type', 'text/csv');
     res.setHeader('Content-Disposition', 'attachment; filename="wid_answers.csv"');
     res.send(csv);
@@ -302,10 +327,9 @@ app.get('/export/csv', async (_req, res) => {
   }
 });
 
-// ===== Reindex (2d: backfill embeddings) =====
+/* ---------------- Reindex embeddings ---------------- */
 app.post('/reindex', async (_req, res) => {
-  if (!process.env.OPENAI_API_KEY) return res.status(400).json({ error: 'OPENAI_API_KEY not set' });
-
+  if (!openai) return res.status(400).json({ error: 'OPENAI_API_KEY not set' });
   const client = await pool.connect();
   try {
     const { rows } = await client.query(`
@@ -316,7 +340,6 @@ app.post('/reindex', async (_req, res) => {
       ORDER BY a.created_at ASC
       LIMIT 100;
     `);
-
     let ok = 0, fail = 0;
     for (const r of rows) {
       try {
@@ -324,8 +347,8 @@ app.post('/reindex', async (_req, res) => {
         await client.query(
           `INSERT INTO answer_embeddings (answer_id, content, embedding)
            VALUES ($1, $2, $3)
-           ON CONFLICT (answer_id)
-           DO UPDATE SET content = EXCLUDED.content, embedding = EXCLUDED.embedding, updated_at = NOW();`,
+           ON CONFLICT (answer_id) DO UPDATE
+           SET content = EXCLUDED.content, embedding = EXCLUDED.embedding, updated_at = NOW();`,
           [r.id, r.answer_text, JSON.stringify(emb)]
         );
         ok++;
@@ -342,18 +365,7 @@ app.post('/reindex', async (_req, res) => {
     client.release();
   }
 });
-// Debug: check if OPENAI_API_KEY is loaded (safe)
-app.get('/debug/openai', (_req, res) => {
-  const ok = !!(process.env.OPENAI_API_KEY && process.env.OPENAI_API_KEY.trim());
-  res.json({ hasKey: ok });
-});
-// TEMP: allow GET /reindex (for easy clicking in browser)
-app.get('/reindex', (req, res) => {
-  // forward this GET to the existing POST handler
-  req.method = 'POST';
-  app._router.handle(req, res, () => {});
-});
 
-// ===== Start =====
+/* ---------------- Start ---------------- */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server on :${PORT}`));
