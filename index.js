@@ -14,6 +14,10 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false } // Render PG uses SSL
 });
 
+ALTER TABLE profiles
+  ADD COLUMN IF NOT EXISTS pin TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS profiles_name_key ON profiles (name);
+
 /* ---------------- OpenAI (guarded) ---------------- */
 const hasOpenAI = !!(process.env.OPENAI_API_KEY && process.env.OPENAI_API_KEY.trim());
 const openai = hasOpenAI ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY }) : null;
