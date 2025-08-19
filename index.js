@@ -381,6 +381,42 @@ app.get('/debug/embed', async (_req, res) => {
     return res.status(500).json({ ok: false, error: msg });
   }
 });
+// --- Profile upsert (very simple "sign in") ---
+// Body: { name: string, pin: string }  -> returns { profile_id, name }
+app.post('/profiles/upsert', async (req, res) => {
+  const { name, pin } = req.body || {};
+  if (!name || !pin) return res.status(400).json({ error: 'name and pin are required' });
+  if (!/^\d{4}$/.test(pin)) return res.status(400).json({ error: 'pin must be 4 digits' });
+
+  const client = await pool.connect();
+  try {
+    // Does a profile with this name exist?
+    const found = await client.query(
+      `SELECT id, name, pin FROM profiles WHERE name = $1 LIMIT 1;`,
+      [name]
+    );
+
+    if (found.rows.length) {
+      const row = found.rows[0];
+      if (row.pin !== pin) return res.status(403).json({ error: 'wrong pin' });
+      return res.json({ profile_id: row.id, name: row.name });
+    }
+
+    // Create a new profile
+    const created = await client.query(
+      `INSERT INTO profiles (name, birth_year, pin)
+       VALUES ($1, NULL, $2)
+       RETURNING id, name;`,
+      [name, pin]
+    );
+    return res.json({ profile_id: created.rows[0].id, name: created.rows[0].name });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'db_error' });
+  } finally {
+    client.release();
+  }
+});
 
 /* ---------------- Start ---------------- */
 const PORT = process.env.PORT || 3000;
