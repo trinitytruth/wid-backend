@@ -440,6 +440,92 @@ app.post('/profiles/upsert', async (req, res) => {
     client.release();
   }
 });
+// Edit an answer's text and refresh its embedding
+app.put('/answers/:id', async (req, res) => {
+  const id = Number(req.params.id);
+  const { text } = req.body || {};
+  if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'invalid id' });
+  if (!text || !String(text).trim()) return res.status(400).json({ error: 'text required' });
+
+  const client = await pool.connect();
+  try {
+    // Ownership/visibility check (optional, simple header check)
+    const { rows: ownerRows } = await client.query(
+      'SELECT profile_id FROM answers WHERE id = $1 LIMIT 1;',
+      [id]
+    );
+    if (!ownerRows.length) return res.status(404).json({ error: 'not_found' });
+
+    const headerProfileId = parseProfileId(req);
+    if (headerProfileId && ownerRows[0].profile_id !== headerProfileId) {
+      return res.status(403).json({ error: 'forbidden' });
+    }
+
+    // Update text
+    await client.query(
+      `UPDATE answers
+         SET answer_text = $1,
+             updated_at = now()
+       WHERE id = $2;`,
+      [text, id]
+    );
+
+    // Update embedding (best-effort)
+    try {
+      if (openai) {
+        const emb = await embedText(text);
+        await client.query(
+          `INSERT INTO answer_embeddings (answer_id, content, embedding)
+           VALUES ($1, $2, $3)
+           ON CONFLICT (answer_id) DO UPDATE
+             SET content = EXCLUDED.content,
+                 embedding = EXCLUDED.embedding,
+                 updated_at = NOW();`,
+          [id, text, JSON.stringify(emb)]
+        );
+      }
+    } catch (e2) {
+      console.error('embedding_update_failed', e2?.response?.data || e2);
+      // don’t fail the edit just because embedding update failed
+    }
+
+    res.json({ ok: true, id });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'db_error' });
+  } finally {
+    client.release();
+  }
+});
+
+// Delete an answer (embedding is auto-removed via ON DELETE CASCADE)
+app.delete('/answers/:id', async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'invalid id' });
+
+  const client = await pool.connect();
+  try {
+    // Ownership check
+    const { rows: ownerRows } = await client.query(
+      'SELECT profile_id FROM answers WHERE id = $1 LIMIT 1;',
+      [id]
+    );
+    if (!ownerRows.length) return res.status(404).json({ error: 'not_found' });
+
+    const headerProfileId = parseProfileId(req);
+    if (headerProfileId && ownerRows[0].profile_id !== headerProfileId) {
+      return res.status(403).json({ error: 'forbidden' });
+    }
+
+    await client.query('DELETE FROM answers WHERE id = $1;', [id]);
+    res.json({ ok: true, id });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'db_error' });
+  } finally {
+    client.release();
+  }
+});
 
 /* ---------------- Start ---------------- */
 const PORT = process.env.PORT || 3000;
