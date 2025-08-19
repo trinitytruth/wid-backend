@@ -41,3 +41,7 @@ CREATE TABLE IF NOT EXISTS answer_embeddings (
   created_at  TIMESTAMP NOT NULL DEFAULT NOW(),
   updated_at  TIMESTAMP NOT NULL DEFAULT NOW()
 );
+
+ALTER TABLE profiles
+  ADD COLUMN IF NOT EXISTS pin TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS profiles_name_key ON profiles (name);
