@@ -365,6 +365,22 @@ app.post('/reindex', async (_req, res) => {
     client.release();
   }
 });
+// ---- Debug: test a single embedding call ----
+app.get('/debug/embed', async (_req, res) => {
+  try {
+    if (!process.env.OPENAI_API_KEY) {
+      return res.status(400).json({ ok: false, error: 'OPENAI_API_KEY not set' });
+    }
+    const sample = 'hello world';
+    // reuse your embedText helper if available:
+    const vec = await embedText(sample);
+    return res.json({ ok: true, dims: vec.length });
+  } catch (e) {
+    // show the real message so we know exactly why it failed
+    const msg = e?.response?.data || e?.message || String(e);
+    return res.status(500).json({ ok: false, error: msg });
+  }
+});
 
 /* ---------------- Start ---------------- */
 const PORT = process.env.PORT || 3000;
