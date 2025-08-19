@@ -69,12 +69,23 @@ app.get('/debug/openai', (_req, res) => {
 });
 
 /* ---------------- Save Answer (writes embedding) ---------------- */
-async function saveAnswerCore(client, { question, text }) {
-  const prof = await client.query("SELECT id FROM profiles ORDER BY id LIMIT 1;");
-  const profileId = prof.rows[0].id;
+async function saveAnswerCore(client, { question, text, profileId }) {
+  // If a profileId was provided, make sure it exists; otherwise fall back to the first profile
+  if (profileId) {
+    const chk = await client.query(`SELECT id FROM profiles WHERE id = $1 LIMIT 1;`, [profileId]);
+    if (!chk.rows.length) {
+      profileId = null; // invalid id -> fall back below
+    }
+  }
+  if (!profileId) {
+    const prof = await client.query(`SELECT id FROM profiles ORDER BY id LIMIT 1;`);
+    profileId = prof.rows[0].id;
+  }
 
   const result = await client.query(
-    "INSERT INTO answers (profile_id, question, answer_text) VALUES ($1, $2, $3) RETURNING id, created_at;",
+    `INSERT INTO answers (profile_id, question, answer_text)
+     VALUES ($1, $2, $3)
+     RETURNING id, created_at;`,
     [profileId, question, text]
   );
   const answerId = result.rows[0].id;
@@ -87,7 +98,9 @@ async function saveAnswerCore(client, { question, text }) {
         `INSERT INTO answer_embeddings (answer_id, content, embedding)
          VALUES ($1, $2, $3)
          ON CONFLICT (answer_id) DO UPDATE
-         SET content = EXCLUDED.content, embedding = EXCLUDED.embedding, updated_at = NOW();`,
+           SET content = EXCLUDED.content,
+               embedding = EXCLUDED.embedding,
+               updated_at = NOW();`,
         [answerId, text, JSON.stringify(emb)]
       );
     }
@@ -98,6 +111,7 @@ async function saveAnswerCore(client, { question, text }) {
   return { id: answerId, created_at: result.rows[0].created_at };
 }
 
+
 // Primary endpoint the frontend uses
 app.post('/save-answer', async (req, res) => {
   const { question, text } = req.body || {};
@@ -105,7 +119,8 @@ app.post('/save-answer', async (req, res) => {
 
   const client = await pool.connect();
   try {
-    const out = await saveAnswerCore(client, { question, text });
+    const headerProfileId = parseProfileId(req); // <-- read X-Profile-Id
+    const out = await saveAnswerCore(client, { question, text, profileId: headerProfileId });
     res.json(out);
   } catch (e) {
     console.error(e);
