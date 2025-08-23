@@ -9,18 +9,13 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '1mb' }));
 
+/* ---------------- DB ---------------- */
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false } // Render PG uses SSL
 });
 
-function parseProfileId(req) {
-  const raw = req.get('x-profile-id');
-  const id = Number(raw);
-  return Number.isInteger(id) && id > 0 ? id : null;
-}
-
-/* ---------------- OpenAI (guarded) ---------------- */
+/* ---------------- OpenAI ---------------- */
 const hasOpenAI = !!(process.env.OPENAI_API_KEY && process.env.OPENAI_API_KEY.trim());
 const openai = hasOpenAI ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY }) : null;
 
@@ -33,12 +28,32 @@ async function embedText(text) {
 function cosineSim(a, b) {
   let dot = 0, na = 0, nb = 0;
   const len = Math.min(a.length, b.length);
-  for (let i = 0; i < len; i++) {
-    const x = a[i], y = b[i];
-    dot += x * y; na += x * x; nb += y * y;
-  }
+  for (let i = 0; i < len; i++) { const x = a[i], y = b[i]; dot += x * y; na += x * x; nb += y * y; }
   const denom = Math.sqrt(na) * Math.sqrt(nb) || 1;
   return dot / denom;
+}
+
+/* ---------------- Helpers ---------------- */
+function headerProfileId(req) {
+  // Express header names are case-insensitive, but read both for clarity
+  const raw = req.get('X-Profile-Id') ?? req.get('x-profile-id');
+  const id = Number(raw);
+  if (!Number.isInteger(id) || id <= 0) {
+    const err = new Error('missing profile id');
+    err.status = 401;
+    throw err;
+  }
+  return id;
+}
+
+async function ensureProfileExists(client, id) {
+  const { rows } = await client.query('SELECT id FROM profiles WHERE id = $1 LIMIT 1;', [id]);
+  if (!rows.length) {
+    const err = new Error('invalid profile id');
+    err.status = 401;
+    throw err;
+  }
+  return id;
 }
 
 /* ---------------- DB init ---------------- */
@@ -47,10 +62,11 @@ async function init() {
   try {
     const schema = readFileSync('./schema.sql', 'utf8');
     await client.query(schema);
-    // Ensure a default profile exists
-    const { rows } = await client.query("SELECT id FROM profiles ORDER BY id LIMIT 1;");
+
+    // Optional: ensure there is at least one profile (legacy)
+    const { rows } = await client.query('SELECT id FROM profiles ORDER BY id LIMIT 1;');
     if (rows.length === 0) {
-      await client.query("INSERT INTO profiles (name, birth_year) VALUES ('Me', NULL);");
+      await client.query("INSERT INTO profiles (name, birth_year, pin) VALUES ('Me', NULL, '0000');");
     }
     console.log('DB ready ✅');
   } finally {
@@ -64,23 +80,12 @@ init().catch(err => {
 
 /* ---------------- Health & debug ---------------- */
 app.get('/health', (_req, res) => res.json({ ok: true }));
-app.get('/debug/openai', (_req, res) => {
-  res.json({ hasKey: hasOpenAI });
-});
+app.get('/debug/openai', (_req, res) => res.json({ hasKey: hasOpenAI }));
 
 /* ---------------- Save Answer (writes embedding) ---------------- */
 async function saveAnswerCore(client, { question, text, profileId }) {
-  // If a profileId was provided, make sure it exists; otherwise fall back to the first profile
-  if (profileId) {
-    const chk = await client.query(`SELECT id FROM profiles WHERE id = $1 LIMIT 1;`, [profileId]);
-    if (!chk.rows.length) {
-      profileId = null; // invalid id -> fall back below
-    }
-  }
-  if (!profileId) {
-    const prof = await client.query(`SELECT id FROM profiles ORDER BY id LIMIT 1;`);
-    profileId = prof.rows[0].id;
-  }
+  // Hard-require a valid profile (no more fallback)
+  await ensureProfileExists(client, profileId);
 
   const result = await client.query(
     `INSERT INTO answers (profile_id, question, answer_text)
@@ -111,26 +116,25 @@ async function saveAnswerCore(client, { question, text, profileId }) {
   return { id: answerId, created_at: result.rows[0].created_at };
 }
 
-
-// Primary endpoint the frontend uses
+/* Primary endpoint the frontend uses */
 app.post('/save-answer', async (req, res) => {
   const { question, text } = req.body || {};
   if (!question || !text) return res.status(400).json({ error: 'question and text are required' });
 
   const client = await pool.connect();
   try {
-    const headerProfileId = parseProfileId(req); // <-- read X-Profile-Id
-    const out = await saveAnswerCore(client, { question, text, profileId: headerProfileId });
+    const pid = await ensureProfileExists(client, headerProfileId(req));
+    const out = await saveAnswerCore(client, { question, text, profileId: pid });
     res.json(out);
   } catch (e) {
     console.error(e);
-    res.status(500).json({ error: 'db_error' });
+    res.status(e.status || 500).json({ error: e.message || 'db_error' });
   } finally {
     client.release();
   }
 });
 
-// Aliases so older paths still work
+/* Back-compat aliases (require profile header now) */
 app.post(
   ['/saveAnswer', '/answers', '/api/answers', '/api/saveAnswer', '/intake/answers', '/v1/answer'],
   async (req, res) => {
@@ -141,11 +145,12 @@ app.post(
 
     const client = await pool.connect();
     try {
-      const out = await saveAnswerCore(client, { question: q, text: t });
+      const pid = await ensureProfileExists(client, headerProfileId(req));
+      const out = await saveAnswerCore(client, { question: q, text: t, profileId: pid });
       res.json(out);
     } catch (e) {
       console.error(e);
-      res.status(500).json({ error: 'db_error' });
+      res.status(e.status || 500).json({ error: e.message || 'db_error' });
     } finally {
       client.release();
     }
@@ -160,25 +165,28 @@ app.post('/chat', async (req, res) => {
   const disclosure = "AI reconstruction based on your recorded words.";
   const client = await pool.connect();
 
-  // Tone defaults (0..1 sliders)
-  const formality = typeof tone?.formality === 'number' ? tone.formality : 0.5; // 0=Casual, 1=Formal
-  const detail    = typeof tone?.detail === 'number'    ? tone.detail    : 0.5; // 0=Concise, 1=Story-rich
-  const humor     = typeof tone?.humor === 'number'     ? tone.humor     : 0.5; // 0=Serious, 1=Playful
+  const formality = typeof tone?.formality === 'number' ? tone.formality : 0.5;
+  const detail    = typeof tone?.detail === 'number'    ? tone.detail    : 0.5;
+  const humor     = typeof tone?.humor === 'number'     ? tone.humor     : 0.5;
 
   try {
     if (!openai) throw new Error('no_openai_key');
 
+    const pid = await ensureProfileExists(client, headerProfileId(req));
+
     // 1) Embed the query
     const qEmb = await embedText(message);
 
-    // 2) Retrieve candidates with embeddings
-    const { rows } = await client.query(`
-      SELECT a.id, a.question, a.answer_text, e.embedding
-      FROM answers a
-      JOIN answer_embeddings e ON e.answer_id = a.id
-      ORDER BY a.created_at DESC
-      LIMIT 200;
-    `);
+    // 2) Retrieve THIS PROFILE'S answers + embeddings
+    const { rows } = await client.query(
+      `SELECT a.id, a.question, a.answer_text, e.embedding
+         FROM answers a
+         JOIN answer_embeddings e ON e.answer_id = a.id
+        WHERE a.profile_id = $1
+        ORDER BY a.created_at DESC
+        LIMIT 200;`,
+      [pid]
+    );
 
     // 3) Score by cosine similarity
     const scored = rows.map(r => {
@@ -239,23 +247,23 @@ A: ${r.answer_text}`
 
     return res.json({
       answer,
-      // citations available if you later want to show them
       citations: top.map((r, i) => ({ idx: i + 1, question: r.question, score: r.score }))
     });
 
   } catch (e) {
-    // Fallback to simple retrieval so chat never breaks
+    // Fallback simple retrieval within THIS profile so chat never breaks
     console.warn('chat_fallback', e?.message || e);
     try {
-      const q = `
-        SELECT question, answer_text
-        FROM answers
-        WHERE answer_text ILIKE '%' || $1 || '%'
-           OR question    ILIKE '%' || $1 || '%'
-        ORDER BY created_at DESC
-        LIMIT 3;
-      `;
-      const { rows } = await client.query(q, [message.split(/\s+/)[0] || message]);
+      const pid = headerProfileId(req); // may throw 401
+      const { rows } = await client.query(
+        `SELECT question, answer_text
+           FROM answers
+          WHERE profile_id = $1
+            AND (answer_text ILIKE '%' || $2 || '%' OR question ILIKE '%' || $2 || '%')
+          ORDER BY created_at DESC
+          LIMIT 3;`,
+        [pid, (message.split(/\s+/)[0] || message)]
+      );
       const snippets = rows.map(r => `• Q: ${r.question}\n  A: ${r.answer_text}`).join('\n');
       const reply = rows.length
         ? `You asked: "${message}".\nHere are bits I found from your saved words:\n${snippets}\n\n${disclosure}`
@@ -263,70 +271,78 @@ A: ${r.answer_text}`
       return res.json({ answer: reply });
     } catch (e2) {
       console.error(e2);
-      return res.status(500).json({ error: 'db_error' });
+      return res.status(e2.status || 500).json({ error: e2.message || 'db_error' });
     }
   } finally {
     client.release();
   }
 });
 
-/* ---------------- Review & Export helpers ---------------- */
+/* ---------------- Review & Export (scoped) ---------------- */
 app.get('/answers', async (req, res) => {
   const client = await pool.connect();
   try {
-    const headerProfileId = parseProfileId(req); // optional
-    const q = `
-      SELECT id, question, answer_text, created_at, updated_at
-      FROM answers
-      WHERE ($1::bigint IS NULL OR profile_id = $1)
-      ORDER BY created_at DESC
-      LIMIT 100;
-    `;
-    const { rows } = await client.query(q, [headerProfileId]);
+    const pid = await ensureProfileExists(client, headerProfileId(req));
+    const { rows } = await client.query(
+      `SELECT id, question, answer_text, created_at, updated_at
+         FROM answers
+        WHERE profile_id = $1
+        ORDER BY created_at DESC
+        LIMIT 100;`,
+      [pid]
+    );
     res.json({ items: rows });
   } catch (e) {
     console.error(e);
-    res.status(500).json({ error: 'db_error' });
+    res.status(e.status || 500).json({ error: e.message || 'db_error' });
   } finally {
     client.release();
   }
 });
 
-app.get('/answers/count', async (_req, res) => {
+app.get('/answers/count', async (req, res) => {
   const client = await pool.connect();
   try {
-    const { rows } = await client.query('SELECT COUNT(*)::int AS count FROM answers;');
+    const pid = await ensureProfileExists(client, headerProfileId(req));
+    const { rows } = await client.query(
+      'SELECT COUNT(*)::int AS count FROM answers WHERE profile_id = $1;',
+      [pid]
+    );
     res.json({ count: rows[0].count });
   } catch (e) {
     console.error(e);
-    res.status(500).json({ error: 'db_error' });
+    res.status(e.status || 500).json({ error: e.message || 'db_error' });
   } finally {
     client.release();
   }
 });
 
-app.get('/export/json', async (_req, res) => {
+app.get('/export/json', async (req, res) => {
   const client = await pool.connect();
   try {
+    const pid = await ensureProfileExists(client, headerProfileId(req));
     const { rows } = await client.query(
-      'SELECT question, answer_text, created_at FROM answers ORDER BY created_at ASC;'
+      'SELECT question, answer_text, created_at FROM answers WHERE profile_id = $1 ORDER BY created_at ASC;',
+      [pid]
     );
     res.setHeader('Content-Type', 'application/json');
     res.setHeader('Content-Disposition', 'attachment; filename="wid_answers.json"');
     res.send(JSON.stringify(rows, null, 2));
   } catch (e) {
     console.error(e);
-    res.status(500).json({ error: 'db_error' });
+    res.status(e.status || 500).json({ error: e.message || 'db_error' });
   } finally {
     client.release();
   }
 });
 
-app.get('/export/csv', async (_req, res) => {
+app.get('/export/csv', async (req, res) => {
   const client = await pool.connect();
   try {
+    const pid = await ensureProfileExists(client, headerProfileId(req));
     const { rows } = await client.query(
-      'SELECT question, answer_text, created_at FROM answers ORDER BY created_at ASC;'
+      'SELECT question, answer_text, created_at FROM answers WHERE profile_id = $1 ORDER BY created_at ASC;',
+      [pid]
     );
     const header = 'question,answer_text,created_at\n';
     const escape = (s = '') => `"${String(s).replaceAll('"', '""')}"`;
@@ -344,25 +360,27 @@ app.get('/export/csv', async (_req, res) => {
     res.send(csv);
   } catch (e) {
     console.error(e);
-    res.status(500).json({ error: 'db_error' });
+    res.status(e.status || 500).json({ error: e.message || 'db_error' });
   } finally {
     client.release();
   }
 });
 
-/* ---------------- Reindex embeddings ---------------- */
-app.post('/reindex', async (_req, res) => {
+/* ---------------- Reindex embeddings (scoped) ---------------- */
+app.post('/reindex', async (req, res) => {
   if (!openai) return res.status(400).json({ error: 'OPENAI_API_KEY not set' });
   const client = await pool.connect();
   try {
-    const { rows } = await client.query(`
-      SELECT a.id, a.answer_text
-      FROM answers a
-      LEFT JOIN answer_embeddings e ON e.answer_id = a.id
-      WHERE e.answer_id IS NULL
-      ORDER BY a.created_at ASC
-      LIMIT 100;
-    `);
+    const pid = await ensureProfileExists(client, headerProfileId(req));
+    const { rows } = await client.query(
+      `SELECT a.id, a.answer_text
+         FROM answers a
+    LEFT JOIN answer_embeddings e ON e.answer_id = a.id
+        WHERE a.profile_id = $1 AND e.answer_id IS NULL
+        ORDER BY a.created_at ASC
+        LIMIT 100;`,
+      [pid]
+    );
     let ok = 0, fail = 0;
     for (const r of rows) {
       try {
@@ -371,7 +389,9 @@ app.post('/reindex', async (_req, res) => {
           `INSERT INTO answer_embeddings (answer_id, content, embedding)
            VALUES ($1, $2, $3)
            ON CONFLICT (answer_id) DO UPDATE
-           SET content = EXCLUDED.content, embedding = EXCLUDED.embedding, updated_at = NOW();`,
+             SET content = EXCLUDED.content,
+                 embedding = EXCLUDED.embedding,
+                 updated_at = NOW();`,
           [r.id, r.answer_text, JSON.stringify(emb)]
         );
         ok++;
@@ -383,29 +403,29 @@ app.post('/reindex', async (_req, res) => {
     res.json({ indexed: ok, failed: fail, remainingHint: rows.length >= 100 ? 'run again to index more' : 'complete' });
   } catch (e) {
     console.error(e);
-    res.status(500).json({ error: 'db_error' });
+    res.status(e.status || 500).json({ error: e.message || 'db_error' });
   } finally {
     client.release();
   }
 });
-// ---- Debug: test a single embedding call ----
+
+/* ---------------- Debug: test a single embedding call ---------------- */
 app.get('/debug/embed', async (_req, res) => {
   try {
     if (!process.env.OPENAI_API_KEY) {
       return res.status(400).json({ ok: false, error: 'OPENAI_API_KEY not set' });
     }
     const sample = 'hello world';
-    // reuse your embedText helper if available:
     const vec = await embedText(sample);
     return res.json({ ok: true, dims: vec.length });
   } catch (e) {
-    // show the real message so we know exactly why it failed
     const msg = e?.response?.data || e?.message || String(e);
     return res.status(500).json({ ok: false, error: msg });
   }
 });
-// --- Profile upsert (very simple "sign in") ---
-// Body: { name: string, pin: string }  -> returns { profile_id, name }
+
+/* ---------------- Profiles: upsert ---------------- */
+// Body: { name: string, pin: string } -> returns { profile_id, name }
 app.post('/profiles/upsert', async (req, res) => {
   const { name, pin } = req.body || {};
   if (!name || !pin) return res.status(400).json({ error: 'name and pin are required' });
@@ -413,19 +433,15 @@ app.post('/profiles/upsert', async (req, res) => {
 
   const client = await pool.connect();
   try {
-    // Does a profile with this name exist?
     const found = await client.query(
       `SELECT id, name, pin FROM profiles WHERE name = $1 LIMIT 1;`,
       [name]
     );
-
     if (found.rows.length) {
       const row = found.rows[0];
       if (row.pin !== pin) return res.status(403).json({ error: 'wrong pin' });
       return res.json({ profile_id: row.id, name: row.name });
     }
-
-    // Create a new profile
     const created = await client.query(
       `INSERT INTO profiles (name, birth_year, pin)
        VALUES ($1, NULL, $2)
@@ -440,7 +456,8 @@ app.post('/profiles/upsert', async (req, res) => {
     client.release();
   }
 });
-// Edit an answer's text and refresh its embedding
+
+/* ---------------- Edit/Delete (ownership enforced) ---------------- */
 app.put('/answers/:id', async (req, res) => {
   const id = Number(req.params.id);
   const { text } = req.body || {};
@@ -449,24 +466,13 @@ app.put('/answers/:id', async (req, res) => {
 
   const client = await pool.connect();
   try {
-    // Ownership/visibility check (optional, simple header check)
-    const { rows: ownerRows } = await client.query(
-      'SELECT profile_id FROM answers WHERE id = $1 LIMIT 1;',
-      [id]
-    );
+    const pid = await ensureProfileExists(client, headerProfileId(req));
+    const { rows: ownerRows } = await client.query('SELECT profile_id FROM answers WHERE id = $1 LIMIT 1;', [id]);
     if (!ownerRows.length) return res.status(404).json({ error: 'not_found' });
+    if (ownerRows[0].profile_id !== pid) return res.status(403).json({ error: 'forbidden' });
 
-    const headerProfileId = parseProfileId(req);
-    if (headerProfileId && ownerRows[0].profile_id !== headerProfileId) {
-      return res.status(403).json({ error: 'forbidden' });
-    }
-
-    // Update text
     await client.query(
-      `UPDATE answers
-         SET answer_text = $1,
-             updated_at = now()
-       WHERE id = $2;`,
+      `UPDATE answers SET answer_text = $1, updated_at = now() WHERE id = $2;`,
       [text, id]
     );
 
@@ -486,42 +492,33 @@ app.put('/answers/:id', async (req, res) => {
       }
     } catch (e2) {
       console.error('embedding_update_failed', e2?.response?.data || e2);
-      // don’t fail the edit just because embedding update failed
     }
 
     res.json({ ok: true, id });
   } catch (e) {
     console.error(e);
-    res.status(500).json({ error: 'db_error' });
+    res.status(e.status || 500).json({ error: e.message || 'db_error' });
   } finally {
     client.release();
   }
 });
 
-// Delete an answer (embedding is auto-removed via ON DELETE CASCADE)
 app.delete('/answers/:id', async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'invalid id' });
 
   const client = await pool.connect();
   try {
-    // Ownership check
-    const { rows: ownerRows } = await client.query(
-      'SELECT profile_id FROM answers WHERE id = $1 LIMIT 1;',
-      [id]
-    );
+    const pid = await ensureProfileExists(client, headerProfileId(req));
+    const { rows: ownerRows } = await client.query('SELECT profile_id FROM answers WHERE id = $1 LIMIT 1;', [id]);
     if (!ownerRows.length) return res.status(404).json({ error: 'not_found' });
-
-    const headerProfileId = parseProfileId(req);
-    if (headerProfileId && ownerRows[0].profile_id !== headerProfileId) {
-      return res.status(403).json({ error: 'forbidden' });
-    }
+    if (ownerRows[0].profile_id !== pid) return res.status(403).json({ error: 'forbidden' });
 
     await client.query('DELETE FROM answers WHERE id = $1;', [id]);
     res.json({ ok: true, id });
   } catch (e) {
     console.error(e);
-    res.status(500).json({ error: 'db_error' });
+    res.status(e.status || 500).json({ error: e.message || 'db_error' });
   } finally {
     client.release();
   }
