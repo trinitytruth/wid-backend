@@ -57,3 +57,6 @@ CREATE INDEX IF NOT EXISTS answers_created_at_idx ON answers (created_at);
 -- Ensure your unique name index doesn't have a stray backslash
 -- (If it already exists, this is fine.)
 CREATE UNIQUE INDEX IF NOT EXISTS profiles_name_key ON profiles (name);
+
+CREATE INDEX IF NOT EXISTS idx_answers_profile_id ON answers(profile_id);
+
