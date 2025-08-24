@@ -533,6 +533,13 @@ app.delete('/answers/:id', async (req, res) => {
   }
 });
 
+// TEMP: list profiles (DEV ONLY)
+// curl https://wid-backend.onrender.com/debug/profiles
+app.get('/debug/profiles', async (_req, res) => {
+  const { rows } = await pool.query('SELECT id, name, pin FROM profiles ORDER BY id ASC;');
+  res.json({ items: rows });
+});
+
 /* ---------------- Start ---------------- */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server on :${PORT}`));
