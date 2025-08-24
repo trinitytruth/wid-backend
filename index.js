@@ -6,7 +6,13 @@ import { Pool } from 'pg';
 import OpenAI from 'openai';
 
 const app = express();
-app.use(cors());
+
+// CORS: explicitly allow custom headers + methods
+app.use(cors({
+  origin: true,
+  methods: ['GET','POST','PUT','DELETE','OPTIONS'],
+  allowedHeaders: ['Content-Type','Authorization','X-Profile-Id','X-Profile-Name']
+}));
 app.use(express.json({ limit: '1mb' }));
 
 /* ---------------- DB ---------------- */
@@ -34,9 +40,12 @@ function cosineSim(a, b) {
 }
 
 /* ---------------- Helpers ---------------- */
-function headerProfileId(req) {
-  // Express header names are case-insensitive, but read both for clarity
-  const raw = req.get('X-Profile-Id') ?? req.get('x-profile-id');
+function getProfileId(req) {
+  // Express normalizes header names, but be defensive
+  const raw =
+    req.get('x-profile-id') ||
+    req.get('X-Profile-Id') ||
+    (req.headers && (req.headers['x-profile-id'] || req.headers['X-Profile-Id']));
   const id = Number(raw);
   if (!Number.isInteger(id) || id <= 0) {
     const err = new Error('missing profile id');
@@ -84,13 +93,12 @@ app.get('/debug/openai', (_req, res) => res.json({ hasKey: hasOpenAI }));
 
 /* ---------------- Save Answer (writes embedding) ---------------- */
 async function saveAnswerCore(client, { question, text, profileId }) {
-  // Hard-require a valid profile (no more fallback)
   await ensureProfileExists(client, profileId);
 
   const result = await client.query(
     `INSERT INTO answers (profile_id, question, answer_text)
      VALUES ($1, $2, $3)
-     RETURNING id, created_at;`,
+     RETURNING id, created_at, profile_id;`,
     [profileId, question, text]
   );
   const answerId = result.rows[0].id;
@@ -123,7 +131,7 @@ app.post('/save-answer', async (req, res) => {
 
   const client = await pool.connect();
   try {
-    const pid = await ensureProfileExists(client, headerProfileId(req));
+    const pid = await ensureProfileExists(client, getProfileId(req));
     const out = await saveAnswerCore(client, { question, text, profileId: pid });
     res.json(out);
   } catch (e) {
@@ -145,7 +153,7 @@ app.post(
 
     const client = await pool.connect();
     try {
-      const pid = await ensureProfileExists(client, headerProfileId(req));
+      const pid = await ensureProfileExists(client, getProfileId(req));
       const out = await saveAnswerCore(client, { question: q, text: t, profileId: pid });
       res.json(out);
     } catch (e) {
@@ -172,7 +180,7 @@ app.post('/chat', async (req, res) => {
   try {
     if (!openai) throw new Error('no_openai_key');
 
-    const pid = await ensureProfileExists(client, headerProfileId(req));
+    const pid = await ensureProfileExists(client, getProfileId(req));
 
     // 1) Embed the query
     const qEmb = await embedText(message);
@@ -254,7 +262,7 @@ A: ${r.answer_text}`
     // Fallback simple retrieval within THIS profile so chat never breaks
     console.warn('chat_fallback', e?.message || e);
     try {
-      const pid = headerProfileId(req); // may throw 401
+      const pid = getProfileId(req); // may throw 401
       const { rows } = await client.query(
         `SELECT question, answer_text
            FROM answers
@@ -282,7 +290,7 @@ A: ${r.answer_text}`
 app.get('/answers', async (req, res) => {
   const client = await pool.connect();
   try {
-    const pid = await ensureProfileExists(client, headerProfileId(req));
+    const pid = await ensureProfileExists(client, getProfileId(req));
     const { rows } = await client.query(
       `SELECT id, question, answer_text, created_at, updated_at
          FROM answers
@@ -303,7 +311,7 @@ app.get('/answers', async (req, res) => {
 app.get('/answers/count', async (req, res) => {
   const client = await pool.connect();
   try {
-    const pid = await ensureProfileExists(client, headerProfileId(req));
+    const pid = await ensureProfileExists(client, getProfileId(req));
     const { rows } = await client.query(
       'SELECT COUNT(*)::int AS count FROM answers WHERE profile_id = $1;',
       [pid]
@@ -320,7 +328,7 @@ app.get('/answers/count', async (req, res) => {
 app.get('/export/json', async (req, res) => {
   const client = await pool.connect();
   try {
-    const pid = await ensureProfileExists(client, headerProfileId(req));
+    const pid = await ensureProfileExists(client, getProfileId(req));
     const { rows } = await client.query(
       'SELECT question, answer_text, created_at FROM answers WHERE profile_id = $1 ORDER BY created_at ASC;',
       [pid]
@@ -339,7 +347,7 @@ app.get('/export/json', async (req, res) => {
 app.get('/export/csv', async (req, res) => {
   const client = await pool.connect();
   try {
-    const pid = await ensureProfileExists(client, headerProfileId(req));
+    const pid = await ensureProfileExists(client, getProfileId(req));
     const { rows } = await client.query(
       'SELECT question, answer_text, created_at FROM answers WHERE profile_id = $1 ORDER BY created_at ASC;',
       [pid]
@@ -371,7 +379,7 @@ app.post('/reindex', async (req, res) => {
   if (!openai) return res.status(400).json({ error: 'OPENAI_API_KEY not set' });
   const client = await pool.connect();
   try {
-    const pid = await ensureProfileExists(client, headerProfileId(req));
+    const pid = await ensureProfileExists(client, getProfileId(req));
     const { rows } = await client.query(
       `SELECT a.id, a.answer_text
          FROM answers a
@@ -409,21 +417,6 @@ app.post('/reindex', async (req, res) => {
   }
 });
 
-/* ---------------- Debug: test a single embedding call ---------------- */
-app.get('/debug/embed', async (_req, res) => {
-  try {
-    if (!process.env.OPENAI_API_KEY) {
-      return res.status(400).json({ ok: false, error: 'OPENAI_API_KEY not set' });
-    }
-    const sample = 'hello world';
-    const vec = await embedText(sample);
-    return res.json({ ok: true, dims: vec.length });
-  } catch (e) {
-    const msg = e?.response?.data || e?.message || String(e);
-    return res.status(500).json({ ok: false, error: msg });
-  }
-});
-
 /* ---------------- Profiles: upsert ---------------- */
 // Body: { name: string, pin: string } -> returns { profile_id, name }
 app.post('/profiles/upsert', async (req, res) => {
@@ -457,7 +450,7 @@ app.post('/profiles/upsert', async (req, res) => {
   }
 });
 
-/* ---------------- Edit/Delete (ownership enforced) ---------------- */
+/* ---------------- Edit/Delete (ownership enforced, with debug) ---------------- */
 app.put('/answers/:id', async (req, res) => {
   const id = Number(req.params.id);
   const { text } = req.body || {};
@@ -466,10 +459,18 @@ app.put('/answers/:id', async (req, res) => {
 
   const client = await pool.connect();
   try {
-    const pid = await ensureProfileExists(client, headerProfileId(req));
+    const pid = await ensureProfileExists(client, getProfileId(req));
     const { rows: ownerRows } = await client.query('SELECT profile_id FROM answers WHERE id = $1 LIMIT 1;', [id]);
-    if (!ownerRows.length) return res.status(404).json({ error: 'not_found' });
-    if (ownerRows[0].profile_id !== pid) return res.status(403).json({ error: 'forbidden' });
+    const owner = ownerRows[0]?.profile_id ?? null;
+    if (owner == null) return res.status(404).json({ error: 'not_found' });
+    if (owner !== pid) {
+      return res.status(403).json({
+        error: 'forbidden',
+        reason: 'owner mismatch',
+        providedProfileId: pid,
+        rowOwnerProfileId: owner
+      });
+    }
 
     await client.query(
       `UPDATE answers SET answer_text = $1, updated_at = now() WHERE id = $2;`,
@@ -509,10 +510,18 @@ app.delete('/answers/:id', async (req, res) => {
 
   const client = await pool.connect();
   try {
-    const pid = await ensureProfileExists(client, headerProfileId(req));
+    const pid = await ensureProfileExists(client, getProfileId(req));
     const { rows: ownerRows } = await client.query('SELECT profile_id FROM answers WHERE id = $1 LIMIT 1;', [id]);
-    if (!ownerRows.length) return res.status(404).json({ error: 'not_found' });
-    if (ownerRows[0].profile_id !== pid) return res.status(403).json({ error: 'forbidden' });
+    const owner = ownerRows[0]?.profile_id ?? null;
+    if (owner == null) return res.status(404).json({ error: 'not_found' });
+    if (owner !== pid) {
+      return res.status(403).json({
+        error: 'forbidden',
+        reason: 'owner mismatch',
+        providedProfileId: pid,
+        rowOwnerProfileId: owner
+      });
+    }
 
     await client.query('DELETE FROM answers WHERE id = $1;', [id]);
     res.json({ ok: true, id });
