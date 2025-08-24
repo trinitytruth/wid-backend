@@ -368,7 +368,7 @@ app.get('/export/csv', async (req, res) => {
     res.send(csv);
   } catch (e) {
     console.error(e);
-    res.status(e.status || 500).json({ error: e.message || 'db_error' });
+    res.status(e.status || 500).json({ error: 'db_error' });
   } finally {
     client.release();
   }
@@ -450,7 +450,7 @@ app.post('/profiles/upsert', async (req, res) => {
   }
 });
 
-/* ---------------- Edit/Delete (ownership enforced, with debug) ---------------- */
+/* ---------------- Edit/Delete (ownership enforced, with debug & numeric compare) ---------------- */
 app.put('/answers/:id', async (req, res) => {
   const id = Number(req.params.id);
   const { text } = req.body || {};
@@ -463,12 +463,12 @@ app.put('/answers/:id', async (req, res) => {
     const { rows: ownerRows } = await client.query('SELECT profile_id FROM answers WHERE id = $1 LIMIT 1;', [id]);
     const owner = ownerRows[0]?.profile_id ?? null;
     if (owner == null) return res.status(404).json({ error: 'not_found' });
-    if (owner !== pid) {
+    if (Number(owner) !== Number(pid)) {
       return res.status(403).json({
         error: 'forbidden',
         reason: 'owner mismatch',
-        providedProfileId: pid,
-        rowOwnerProfileId: owner
+        providedProfileId: Number(pid),
+        rowOwnerProfileId: Number(owner)
       });
     }
 
@@ -514,12 +514,12 @@ app.delete('/answers/:id', async (req, res) => {
     const { rows: ownerRows } = await client.query('SELECT profile_id FROM answers WHERE id = $1 LIMIT 1;', [id]);
     const owner = ownerRows[0]?.profile_id ?? null;
     if (owner == null) return res.status(404).json({ error: 'not_found' });
-    if (owner !== pid) {
+    if (Number(owner) !== Number(pid)) {
       return res.status(403).json({
         error: 'forbidden',
         reason: 'owner mismatch',
-        providedProfileId: pid,
-        rowOwnerProfileId: owner
+        providedProfileId: Number(pid),
+        rowOwnerProfileId: Number(owner)
       });
     }
 
